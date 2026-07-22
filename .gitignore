@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.db
+.sparkedge*/
+.DS_Store
+MISO_BUILD_REPORT.md
