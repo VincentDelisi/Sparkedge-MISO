@@ -326,6 +326,12 @@ class Analytics:
         hr = self.heat_rate_series(market=market)
         if hr.empty:
             return pd.DataFrame()
+        # Day-ahead prices are posted for the whole day, so "most recent row" is
+        # tonight's last hour, not now. Use the latest interval that has started.
+        now = pd.Timestamp.now(tz="UTC")
+        started = hr[pd.to_datetime(hr["interval_start"], utc=True) <= now]
+        if not started.empty:
+            hr = started
         latest = (hr.sort_values("interval_start")
                     .groupby("hub", as_index=False).tail(1))
 
