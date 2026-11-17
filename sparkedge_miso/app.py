@@ -9,7 +9,7 @@ Panels
 
 Everything reads from the SQLite cache. If the cache is empty or a source is
 missing, the relevant panel shows an informational message instead of crashing.
-Use the sidebar "Refresh today's data" button (or the CLI --refresh/--backfill)
+Use the sidebar "Refresh now" button (or the CLI --refresh/--backfill)
 to populate the cache.
 """
 
@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -87,6 +89,55 @@ def get_analytics() -> Analytics:
     return Analytics(get_storage(), SETTINGS)
 
 
+# How often the server pulls fresh MISO data on its own, and how often an open
+# page redraws itself to show it.
+AUTO_REFRESH_MINUTES = 10
+PAGE_REDRAW_SECONDS = 120
+
+# One pull at a time: the background refresher and the sidebar button share this
+# so they never run concurrently.
+_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_now() -> dict[str, int] | None:
+    """Pull today's data. Returns None if a pull is already in progress."""
+    if not _REFRESH_LOCK.acquire(blocking=False):
+        return None
+    try:
+        return DataService(get_storage(), SETTINGS).refresh_today()
+    finally:
+        _REFRESH_LOCK.release()
+
+
+@st.cache_resource
+def start_auto_refresh() -> threading.Thread:
+    """Start one background thread per server process that keeps the cache
+    current. Without it the data only moved when someone pressed the button or
+    the service restarted."""
+    def loop() -> None:
+        while True:
+            time.sleep(AUTO_REFRESH_MINUTES * 60)
+            try:
+                refresh_now()
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                logging.getLogger(__name__).warning("auto-refresh failed: %s", exc)
+
+    t = threading.Thread(target=loop, name="sparkedge-auto-refresh", daemon=True)
+    t.start()
+    return t
+
+
+def _ago(ts: pd.Timestamp) -> str:
+    mins = int((pd.Timestamp.now(tz="UTC") - ts).total_seconds() // 60)
+    if mins < 1:
+        return "just now"
+    if mins < 90:
+        return f"{mins} min ago"
+    if mins < 48 * 60:
+        return f"{mins // 60} h ago"
+    return f"{mins // 1440} days ago"
+
+
 # --------------------------------------------------------------------------- #
 # sidebar controls
 # --------------------------------------------------------------------------- #
@@ -110,19 +161,28 @@ def sidebar() -> dict:
         f"LMP: {cov.get('lmp', 0):,} · Gas: {cov.get('gas_price', 0):,} · "
         f"Load: {cov.get('load_actual', 0):,} · Fuel mix: {cov.get('fuel_mix', 0):,}"
     )
-    last = storage.get_meta("last_refresh")
-    if last:
-        st.sidebar.caption(f"Last refresh: {last[:19]} UTC")
-
-    if st.sidebar.button("🔄 Refresh today's data", use_container_width=True):
+    # Handle the button before reading the timestamp, so the caption below
+    # reflects the pull that just ran.
+    status = None
+    if st.sidebar.button("🔄 Refresh now", use_container_width=True):
         with st.spinner("Pulling latest from MISO…"):
             try:
-                res = DataService(storage, SETTINGS).refresh_today()
-                st.sidebar.success(
-                    "Refreshed: " + ", ".join(f"{k}={v}" for k, v in res.items())
-                )
+                res = refresh_now()
+                status = ("ok", "Updated with the latest MISO data.") if res is not None \
+                    else ("ok", "An update is already running; it will show here shortly.")
             except Exception as exc:  # defensive; refresh already swallows most
-                st.sidebar.error(f"Refresh hit an error: {exc}")
+                status = ("err", f"Refresh hit an error: {exc}")
+
+    last = storage.get_meta("last_refresh")
+    if last:
+        ts = pd.Timestamp(last)
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+        st.sidebar.caption(
+            f"Data last pulled: {ts.tz_convert(SETTINGS.display_tz):%Y-%m-%d %H:%M} EST ({_ago(ts)}) · "
+            f"updates on its own every {AUTO_REFRESH_MINUTES} min"
+        )
+    if status:
+        (st.sidebar.success if status[0] == "ok" else st.sidebar.error)(status[1])
 
     st.sidebar.divider()
     st.sidebar.caption(
@@ -143,7 +203,7 @@ def panel_heat_rate(an: Analytics, market: str) -> None:
     st.subheader("Implied market heat rate  ·  ±2σ rolling band")
     hr = _safe(lambda: an.heat_rate_series(market=market), pd.DataFrame())
     if hr is None or hr.empty:
-        st.info("No LMP/gas data cached yet. Use **Refresh today's data** or run "
+        st.info("No LMP/gas data cached yet. Use **Refresh now** or run "
                 "`python -m sparkedge_miso --backfill`.")
         return
 
@@ -249,9 +309,11 @@ def panel_money_strip(an: Analytics, market: str) -> None:
         return
 
     ts = snap["interval_start"].max()
-    st.caption(f"As of interval starting "
-               f"{pd.Timestamp(ts).tz_convert(SETTINGS.display_tz):%Y-%m-%d %H:%M} EST "
-               f"· {market.replace('_', ' ').title()}")
+    ts_est = pd.Timestamp(ts).tz_convert(SETTINGS.display_tz)
+    if market == "DAY_AHEAD_HOURLY":
+        st.caption(f"Day-ahead price for the hour beginning {ts_est:%Y-%m-%d %H:%M} EST")
+    else:
+        st.caption(f"Real-time 5-minute interval starting {ts_est:%Y-%m-%d %H:%M} EST")
     st.caption(
         "Implied HR = hub LMP ÷ the hub's reference gas. MISO South (Gulf-adjacent) "
         "uses Henry Hub directly; MISO North uses Henry Hub as a labeled proxy "
@@ -439,10 +501,23 @@ def _header(title: str, subtitle: str, logo: str | None = None) -> None:
     )
 
 
-def main() -> None:
-    ctrl = sidebar()
+@st.fragment(run_every=PAGE_REDRAW_SECONDS)
+def panels(market: str) -> None:
+    """The data panels, redrawn on a timer so an open page (including the copy
+    embedded in the main Sparkedge site) picks up new data without a click."""
     an = get_analytics()
-    market = ctrl["market"]
+    panel_money_strip(an, market)
+    st.divider()
+    panel_heat_rate(an, market)
+    st.divider()
+    panel_duck_curve(an)
+    st.divider()
+    panel_alerts(an, market)
+
+
+def main() -> None:
+    start_auto_refresh()
+    ctrl = sidebar()
 
     _header(
         title="Sparkedge MISO",
@@ -454,13 +529,7 @@ def main() -> None:
         logo="sparkedge_logo.png",
     )
 
-    panel_money_strip(an, market)
-    st.divider()
-    panel_heat_rate(an, market)
-    st.divider()
-    panel_duck_curve(an)
-    st.divider()
-    panel_alerts(an, market)
+    panels(ctrl["market"])
 
 
 if __name__ == "__main__":
